@@ -1,11 +1,9 @@
 import requests
 import json
 import time
-import threading
 from datetime import datetime, time as dt_time
 import pandas as pd
 import yfinance as yf
-from flask import Flask, render_template_string
 import logging
 import numpy as np
 import streamlit as st
@@ -17,23 +15,16 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-US,en;q=0.9",
 }
-LOOP_SECONDS = 15  # Increased refresh time for stability
+REFRESH_SECONDS = 15
 YF_TICKER = "^NSEI"
 ATM_PCR_UPPER = 1.2
 ATM_PCR_LOWER = 0.8
 
-# Market timings for NSE (9:15 AM to 3:30 PM IST)
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
-# Setup logging
 logging.basicConfig(filename="app.log", level=logging.INFO,
                     format='%(asctime)s:%(levelname)s:%(message)s')
-
-app = Flask(__name__)
-
-latest_signal = {"time": None, "signal": None, "reasons": []}
-running = True
 
 # ---------- Utility Functions ----------
 
@@ -137,7 +128,6 @@ def market_trend_last5():
         logging.error(f"Error in market_trend_last5: {e}")
         return "NEUTRAL", pd.DataFrame()
 
-# Calculate RSI - helper function
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -148,7 +138,6 @@ def calculate_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-# Simple support/resistance using pivot highs/lows
 def find_support_resistance(prices, window=5):
     supports = []
     resistances = []
@@ -161,16 +150,13 @@ def find_support_resistance(prices, window=5):
             resistances.append(current)
     return supports, resistances
 
-# Simple bullish engulfing pattern detector on last 2 candles
 def is_bullish_engulfing(df):
     if len(df) < 2:
         return False
     prev = df.iloc[-2]
     curr = df.iloc[-1]
-    # Prev candle bearish
     if prev['Close'] >= prev['Open']:
         return False
-    # Current candle bullish and engulf prev
     if curr['Close'] > curr['Open'] and curr['Open'] < prev['Close'] and curr['Close'] > prev['Open']:
         return True
     return False
@@ -260,7 +246,6 @@ def compute_signal(df):
     iv_pe = pe["iv"]
     reasons.append(f"IV CE = {iv_ce:.2f}, IV PE = {iv_pe:.2f}")
 
-    # Example: if IV PE > IV CE by 10% or more, add PE vote (indicates higher fear)
     if iv_pe > iv_ce * 1.1:
         votes.append("PE")
         reasons.append("IV PE significantly higher than IV CE, added PE vote")
@@ -283,201 +268,39 @@ def compute_signal(df):
 
     return "NO TRADE", reasons
 
+# --------- STREAMLIT UI ---------
 
-def data_fetch_loop():
-    global latest_signal
-    session = get_nse_session()
+st.set_page_config(page_title="PRO NIFTY OPTION SIGNAL", layout="wide")
+st.title("PRO NIFTY OPTION SIGNAL")
 
-    while running:
-        try:
-            json_data = fetch_option_chain(session)
-            if json_data is None:
-                session = get_nse_session()
-                time.sleep(3)
-                continue
+session = get_nse_session()
 
-            df = flatten_option_chain(json_data)
-            signal, reasons = compute_signal(df)
-            now = datetime.now().strftime("%H:%M:%S")
+# Auto-refresh using streamlit's experimental_rerun every REFRESH_SECONDS
+while True:
+    json_data = fetch_option_chain(session)
+    df = flatten_option_chain(json_data)
+    signal, reasons = compute_signal(df)
+    now = datetime.now().strftime("%H:%M:%S")
 
-            latest_signal = {
-                "time": now,
-                "signal": signal,
-                "reasons": reasons
-            }
-        except Exception as e:
-            logging.error(f"Error in data fetch loop: {e}")
-
-        time.sleep(LOOP_SECONDS)
-
-
-@app.route("/")
-def home():
-    html = """
-    <html>
-        <head>
-            <title>PRO NIFTY OPTION BUYING - Signal</title>
-            <meta http-equiv="refresh" content="{{refresh}}">
-            <style>
-                * { box-sizing: border-box; }
-
-                body {
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    margin: 0;
-                    padding: 40px 20px;
-                    color: #333;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    min-height: 100vh;
-                    transition: background 0.8s ease;
-                }
-
-                /* Background colors for different signals */
-                body.market-closed {
-                    background: #f39c12; /* orange */
-                    color: #fff;
-                }
-                body.no-trade {
-                    background: #7f8c8d; /* gray */
-                    color: #fff;
-                }
-                body.buy-ce {
-                    background: #27ae60; /* green */
-                    color: #fff;
-                }
-                body.buy-pe {
-                    background: #c0392b; /* red */
-                    color: #fff;
-                }
-                body.strong-buy {
-                    background: #2980b9; /* blue */
-                    color: #fff;
-                }
-
-                .container {
-                    background: rgba(255,255,255,0.9);
-                    padding: 30px 40px;
-                    border-radius: 12px;
-                    box-shadow: 0 10px 30px rgba(0,0,0,0.12);
-                    max-width: 720px;
-                    width: 100%;
-                    text-align: center;
-                    color: #333;
-                }
-
-                h1 {
-                    font-weight: 700;
-                    font-size: 2.6rem;
-                    color: inherit;
-                    margin-bottom: 15px;
-                    letter-spacing: 1px;
-                }
-
-                .time {
-                    font-size: 1rem;
-                    color: inherit;
-                    margin-bottom: 20px;
-                    font-style: italic;
-                }
-
-                .signal {
-                    font-size: 2.2rem;
-                    font-weight: 900;
-                    margin: 20px 0;
-                    padding: 15px;
-                    border-radius: 8px;
-                    text-transform: uppercase;
-                    letter-spacing: 2px;
-                    user-select: none;
-                    color: inherit;
-                }
-
-                /* Colors for signal text box */
-                .buy-ce   { color: #27ae60; background: #ecf9f1; box-shadow: inset 0 0 8px rgba(39,174,96,0.3); }
-                .buy-pe   { color: #c0392b; background: #fdecea; box-shadow: inset 0 0 8px rgba(192,57,43,0.3); }
-                .no-trade { color: #7f8c8d; background: #f4f4f4; box-shadow: inset 0 0 8px rgba(150,150,150,0.25); }
-                .strong-buy { color: #2980b9; background: #e8f4fd; box-shadow: inset 0 0 10px rgba(41,128,185,0.4); }
-
-                .reasons-box {
-                    text-align: left;
-                    margin-top: 20px;
-                    padding: 20px;
-                    background: #fafafa;
-                    border-radius: 10px;
-                    box-shadow: 0 0 8px rgba(0,0,0,0.05);
-                    color: #333;
-                }
-
-                .reasons-box ul {
-                    padding-left: 20px;
-                }
-
-                .footer {
-                    margin-top: 25px;
-                    font-size: 0.8rem;
-                    color: #888;
-                }
-            </style>
-        </head>
-
-        <body class="{{body_class}}">
-            <div class="container">
-                <h1>PRO NIFTY OPTION SIGNAL</h1>
-
-                <div class="time">Last updated: {{time}}</div>
-
-                <div class="signal {{cls}}">{{signal}}</div>
-
-                <div class="reasons-box">
-                    <h3>Reasons</h3>
-                    <ul>
-                        {% for r in reasons %}
-                            <li>{{r}}</li>
-                        {% endfor %}
-                    </ul>
-                </div>
-
-                <div class="footer">Auto-refresh every {{refresh}} seconds</div>
-            </div>
-        </body>
-    </html>
-    """
-
-    sig = latest_signal.get("signal", "")
-    cls = "no-trade"
-    body_class = "no-trade"
-
-    if "MARKET CLOSED" in sig:
-        body_class = "market-closed"
-    elif "BUY CE" in sig:
-        cls = "buy-ce"
-        body_class = "buy-ce"
-    elif "BUY PE" in sig:
-        cls = "buy-pe"
-        body_class = "buy-pe"
-    elif "STRONG BUY CE" in sig:
-        cls = "strong-buy"
-        body_class = "strong-buy"
-    elif sig == "NO TRADE" or sig == "NEUTRAL":
-        body_class = "no-trade"
+    # Display signal with colors
+    if "MARKET CLOSED" in signal:
+        color = "#f39c12"
+    elif "BUY CE" in signal:
+        color = "#27ae60"
+    elif "BUY PE" in signal:
+        color = "#c0392b"
+    elif "STRONG BUY CE" in signal:
+        color = "#2980b9"
     else:
-        # fallback to no-trade
-        body_class = "no-trade"
+        color = "#7f8c8d"
 
-    return render_template_string(
-        html,
-        time=latest_signal.get("time", "--:--:--"),
-        signal=latest_signal.get("signal", "NO DATA"),
-        reasons=latest_signal.get("reasons", []),
-        cls=cls,
-        body_class=body_class,
-        refresh=LOOP_SECONDS
-    )
+    st.markdown(f"<h2 style='color:{color}'>Last updated: {now}</h2>", unsafe_allow_html=True)
+    st.markdown(f"<h1 style='color:{color}'>{signal}</h1>", unsafe_allow_html=True)
 
+    st.subheader("Reasons")
+    for r in reasons:
+        st.write(f"- {r}")
 
-
-
-if __name__ == "__main__":
-    threading.Thread(target=data_fetch_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    st.info(f"Auto-refresh every {REFRESH_SECONDS} seconds")
+    time.sleep(REFRESH_SECONDS)
+    st.experimental_rerun()
