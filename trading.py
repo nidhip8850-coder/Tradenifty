@@ -8,6 +8,19 @@ import logging
 import numpy as np
 import streamlit as st
 
+hide_streamlit_style = """
+    <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+# -----------------------------------
+
+st.title("My Clean Streamlit App")
+st.write("Header / Footer removed successfully!")
+
 # ---------------- CONFIG ----------------
 SYMBOL = "NIFTY"
 OPTION_CHAIN_URL = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
