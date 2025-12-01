@@ -8,6 +8,7 @@ import yfinance as yf
 from flask import Flask, render_template_string
 import logging
 import numpy as np
+import streamlit as st
 
 # ---------------- CONFIG ----------------
 SYMBOL = "NIFTY"
