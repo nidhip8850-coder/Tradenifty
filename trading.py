@@ -15,7 +15,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-US,en;q=0.9",
 }
-REFRESH_SECONDS = 15
+REFRESH_SECONDS = 15  # Auto-refresh interval
 YF_TICKER = "^NSEI"
 ATM_PCR_UPPER = 1.2
 ATM_PCR_LOWER = 0.8
@@ -26,7 +26,7 @@ MARKET_CLOSE = dt_time(15, 30)
 logging.basicConfig(filename="app.log", level=logging.INFO,
                     format='%(asctime)s:%(levelname)s:%(message)s')
 
-# ---------- Utility Functions ----------
+# ---------------- UTILITY FUNCTIONS ----------------
 
 def is_market_open():
     now = datetime.now().time()
@@ -268,39 +268,37 @@ def compute_signal(df):
 
     return "NO TRADE", reasons
 
-# --------- STREAMLIT UI ---------
+# ---------------- STREAMLIT UI ----------------
 
 st.set_page_config(page_title="PRO NIFTY OPTION SIGNAL", layout="wide")
 st.title("PRO NIFTY OPTION SIGNAL")
 
+# Auto-refresh every REFRESH_SECONDS
+st.experimental_autorefresh(interval=REFRESH_SECONDS * 1000, key="refresh")
+
 session = get_nse_session()
+json_data = fetch_option_chain(session)
+df = flatten_option_chain(json_data)
+signal, reasons = compute_signal(df)
+now = datetime.now().strftime("%H:%M:%S")
 
-# Auto-refresh using streamlit's experimental_rerun every REFRESH_SECONDS
-while True:
-    json_data = fetch_option_chain(session)
-    df = flatten_option_chain(json_data)
-    signal, reasons = compute_signal(df)
-    now = datetime.now().strftime("%H:%M:%S")
+# Signal color
+if "MARKET CLOSED" in signal:
+    color = "#f39c12"
+elif "BUY CE" in signal:
+    color = "#27ae60"
+elif "BUY PE" in signal:
+    color = "#c0392b"
+elif "STRONG BUY CE" in signal:
+    color = "#2980b9"
+else:
+    color = "#7f8c8d"
 
-    # Display signal with colors
-    if "MARKET CLOSED" in signal:
-        color = "#f39c12"
-    elif "BUY CE" in signal:
-        color = "#27ae60"
-    elif "BUY PE" in signal:
-        color = "#c0392b"
-    elif "STRONG BUY CE" in signal:
-        color = "#2980b9"
-    else:
-        color = "#7f8c8d"
+st.markdown(f"<h2 style='color:{color}'>Last updated: {now}</h2>", unsafe_allow_html=True)
+st.markdown(f"<h1 style='color:{color}'>{signal}</h1>", unsafe_allow_html=True)
 
-    st.markdown(f"<h2 style='color:{color}'>Last updated: {now}</h2>", unsafe_allow_html=True)
-    st.markdown(f"<h1 style='color:{color}'>{signal}</h1>", unsafe_allow_html=True)
+st.subheader("Reasons")
+for r in reasons:
+    st.write(f"- {r}")
 
-    st.subheader("Reasons")
-    for r in reasons:
-        st.write(f"- {r}")
-
-    st.info(f"Auto-refresh every {REFRESH_SECONDS} seconds")
-    time.sleep(REFRESH_SECONDS)
-    st.experimental_rerun()
+st.info(f"Auto-refresh every {REFRESH_SECONDS} seconds")
