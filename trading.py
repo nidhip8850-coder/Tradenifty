@@ -7,7 +7,7 @@ import yfinance as yf
 import logging
 import numpy as np
 import streamlit as st
-import pytz   # <-- NEW (FOR IST FIX)
+import pytz
 
 hide_streamlit_style = """
     <style>
@@ -38,22 +38,28 @@ MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
 logging.basicConfig(filename="app.log", level=logging.INFO,
-                    format='%(asctime)s:%(levelname)s:%(message)s')
+                    format='%(asctime)s:%(levelname)s:%(message)s'))
 
 # ---------------- STREAMLIT SETUP ----------------
 st.set_page_config(page_title="PRO NIFTY OPTION SIGNAL", layout="wide")
 st.title("PRO NIFTY OPTION SIGNAL")
 placeholder = st.empty()
 
-# ---------- UTILITY FUNCTIONS ----------
-
-# --------------------- FIXED ---------------------
+# ---------- FIXED MARKET TIME FUNCTION ----------
 def is_market_open():
     ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist).time()   # correct IST time
-    return MARKET_OPEN <= now <= MARKET_CLOSE
-# -------------------------------------------------
+    now = datetime.now(ist)
 
+    current_time = now.time()
+
+    # Sat/Sun closed
+    if now.weekday() >= 5:
+        return False
+
+    # Time check
+    return MARKET_OPEN <= current_time <= MARKET_CLOSE
+
+# ---------- OTHER FUNCTIONS (unchanged) ----------
 def get_nse_session():
     s = requests.Session()
     try:
@@ -180,19 +186,27 @@ def is_bullish_engulfing(df):
 def compute_signal(df):
     if not is_market_open():
         return "MARKET CLOSED", ["Market is closed. Trading hours: 9:15 AM to 3:30 PM IST"]
+
     if df.empty:
         return "NO DATA", ["Option chain empty"]
+
     underlying = df["underlying"].dropna().unique()
     if len(underlying) == 0:
         return "NO DATA", ["Underlying missing"]
+
     underlying_val = underlying[0]
     atm = int(round(underlying_val / 50) * 50)
     atm_rows = df[df["strike"] == atm]
+
     if atm_rows.empty:
         return "NO DATA", [f"ATM {atm} missing"]
+
     ce = atm_rows[atm_rows["side"] == "CE"].iloc[0]
     pe = atm_rows[atm_rows["side"] == "PE"].iloc[0]
+
     reasons = [f"Underlying = {underlying_val}, ATM = {atm}"]
+
+    # Volume
     if pe["vol"] > ce["vol"]:
         vol_side = "PE"
         reasons.append("PE Volume > CE Volume")
@@ -202,6 +216,8 @@ def compute_signal(df):
     else:
         vol_side = "NEUTRAL"
         reasons.append("Volumes equal")
+
+    # COI
     if pe["coi"] > ce["coi"]:
         oi_side = "PE"
         reasons.append("PE COI > CE COI")
@@ -211,47 +227,66 @@ def compute_signal(df):
     else:
         oi_side = "NEUTRAL"
         reasons.append("COI equal")
+
+    # PCR
     pcr = round(pe["oi"] / ce["oi"], 2) if ce["oi"] else 1.0
     reasons.append(f"PCR = {pcr}")
+
     if pcr > ATM_PCR_UPPER:
         pcr_side = "CE"
     elif pcr < ATM_PCR_LOWER:
         pcr_side = "PE"
     else:
         pcr_side = "NEUTRAL"
+
+    # Trend
     trend, df_und = market_trend_last5()
     reasons.append(f"Trend = {trend}")
+
+    # RSI
     rsi = calculate_rsi(df_und['Close'])
     latest_rsi = round(rsi.iloc[-1], 2) if not rsi.empty else None
     reasons.append(f"RSI(14) = {latest_rsi}")
+
+    # S/R
     supports, resistances = find_support_resistance(df_und['Close'])
     reasons.append(f"Support levels (last): {supports[-3:] if supports else 'N/A'}")
     reasons.append(f"Resistance levels (last): {resistances[-3:] if resistances else 'N/A'}")
+
+    # Pattern
     bullish_engulf = is_bullish_engulfing(df_und)
     reasons.append(f"Bullish Engulfing Pattern: {'Yes' if bullish_engulf else 'No'}")
+
+    # Votes
     votes = [vol_side, oi_side, pcr_side]
+
     if trend == "UP":
         votes.append("CE")
     elif trend == "DOWN":
         votes.append("PE")
+
     iv_ce = ce["iv"]
     iv_pe = pe["iv"]
     reasons.append(f"IV CE = {iv_ce:.2f}, IV PE = {iv_pe:.2f}")
+
     if iv_pe > iv_ce * 1.1:
         votes.append("PE")
         reasons.append("IV PE significantly higher than IV CE, added PE vote")
     elif iv_ce > iv_pe * 1.1:
         votes.append("CE")
         reasons.append("IV CE significantly higher than IV PE, added CE vote")
+
     ce_votes = votes.count("CE")
     pe_votes = votes.count("PE")
     reasons.append(f"Votes -> CE:{ce_votes}, PE:{pe_votes}")
+
     if ce_votes > pe_votes and ce_votes >= 2:
         return "BUY CE", reasons
     if pe_votes > ce_votes and pe_votes >= 2:
         return "BUY PE", reasons
     if bullish_engulf and trend == "UP":
         return "STRONG BUY CE (Bullish Engulfing)", reasons
+
     return "NO TRADE", reasons
 
 # ---------------- SESSION ----------------
