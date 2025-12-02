@@ -1,69 +1,298 @@
 import streamlit as st
-from datetime import datetime
-import pytz
+import requests
+import json
 import time
+import threading
+from datetime import datetime, time as dt_time
+import pandas as pd
+import yfinance as yf
+import logging
+import numpy as np
 
-# ========== TIME SETTINGS ==========
-IST = pytz.timezone("Asia/Kolkata")
+# ---------------- CONFIG ----------------
+SYMBOL = "NIFTY"
+OPTION_CHAIN_URL = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+LOOP_SECONDS = 15  
+YF_TICKER = "^NSEI"
+ATM_PCR_UPPER = 1.2
+ATM_PCR_LOWER = 0.8
 
-def get_market_status():
-    now = datetime.now(IST)
+# Market timings
+MARKET_OPEN = dt_time(9, 15)
+MARKET_CLOSE = dt_time(15, 30)
 
-    market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+logging.basicConfig(filename="app.log", level=logging.INFO,
+                    format='%(asctime)s:%(levelname)s:%(message)s')
 
-    if market_open <= now <= market_close:
-        return "MARKET OPEN", now
+latest_signal = {"time": None, "signal": None, "reasons": []}
+running = True
+
+
+# ---------- Utility Functions ----------
+def is_market_open():
+    now = datetime.now().time()
+    return MARKET_OPEN <= now <= MARKET_CLOSE
+
+
+def get_nse_session():
+    s = requests.Session()
+    try:
+        s.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
+        time.sleep(0.3)
+    except Exception as e:
+        logging.error(f"NSE session setup failed: {e}")
+    return s
+
+
+def safe_json_load(resp):
+    try:
+        return resp.json()
+    except Exception:
+        text = resp.text
+        idx = text.rfind("}")
+        if idx != -1:
+            try:
+                return json.loads(text[: idx + 1])
+            except Exception:
+                return None
+        return None
+
+
+def fetch_option_chain(session):
+    tries = 0
+    backoff = 1
+    while tries < 5:
+        try:
+            r = session.get(OPTION_CHAIN_URL, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            return safe_json_load(r)
+        except Exception:
+            tries += 1
+            time.sleep(backoff)
+            backoff *= 2
+    return None
+
+
+def flatten_option_chain(json_data):
+    if not json_data:
+        return pd.DataFrame()
+
+    rec = json_data.get("records", {})
+    underlying = rec.get("underlyingValue", None)
+    data = rec.get("data", [])
+    rows = []
+
+    for item in data:
+        strike = item.get("strikePrice")
+        ce = item.get("CE")
+        pe = item.get("PE")
+
+        if ce:
+            rows.append({
+                "side": "CE",
+                "strike": strike,
+                "oi": float(ce.get("openInterest", 0)),
+                "coi": float(ce.get("changeinOpenInterest", 0)),
+                "vol": float(ce.get("totalTradedVolume", 0)),
+                "iv": float(ce.get("impliedVolatility", 0)) if ce.get("impliedVolatility") else 0,
+                "underlying": underlying
+            })
+        if pe:
+            rows.append({
+                "side": "PE",
+                "strike": strike,
+                "oi": float(pe.get("openInterest", 0)),
+                "coi": float(pe.get("changeinOpenInterest", 0)),
+                "vol": float(pe.get("totalTradedVolume", 0)),
+                "iv": float(pe.get("impliedVolatility", 0)) if pe.get("impliedVolatility") else 0,
+                "underlying": underlying
+            })
+
+    return pd.DataFrame(rows)
+
+
+def market_trend_last5():
+    try:
+        df = yf.download(YF_TICKER, period="1d", interval="1m", progress=False)
+        if df.empty:
+            return "NEUTRAL", df
+
+        closes = df["Close"].values
+        if len(closes) < 5:
+            return "NEUTRAL", df
+
+        last5 = closes[-5:]
+        if all(last5[i] > last5[i - 1] for i in range(1, 5)):
+            return "UP", df
+        if all(last5[i] < last5[i - 1] for i in range(1, 5)):
+            return "DOWN", df
+        return "NEUTRAL", df
+    except:
+        return "NEUTRAL", pd.DataFrame()
+
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def find_support_resistance(prices, window=5):
+    supports = []
+    resistances = []
+    for i in range(window, len(prices) - window):
+        segment = prices[i - window:i + window + 1]
+        current = prices[i]
+        if current == min(segment):
+            supports.append(current)
+        if current == max(segment):
+            resistances.append(current)
+    return supports, resistances
+
+
+def is_bullish_engulfing(df):
+    if len(df) < 2:
+        return False
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    if prev['Close'] >= prev['Open']:
+        return False
+    if curr['Close'] > curr['Open'] and curr['Open'] < prev['Close'] and curr['Close'] > prev['Open']:
+        return True
+    return False
+
+
+def compute_signal(df):
+    if not is_market_open():
+        return "MARKET CLOSED", ["Trading hours: 9:15 AM to 3:30 PM IST"]
+
+    if df.empty:
+        return "NO DATA", ["Option chain empty"]
+
+    underlying = df["underlying"].dropna().unique()
+    if len(underlying) == 0:
+        return "NO DATA", ["Underlying missing"]
+
+    underlying_val = underlying[0]
+    atm = int(round(underlying_val / 50) * 50)
+
+    atm_rows = df[df["strike"] == atm]
+    if atm_rows.empty:
+        return "NO DATA", [f"ATM {atm} missing"]
+
+    ce = atm_rows[atm_rows["side"] == "CE"].iloc[0]
+    pe = atm_rows[atm_rows["side"] == "PE"].iloc[0]
+
+    reasons = [f"Underlying = {underlying_val}, ATM = {atm}"]
+
+    vol_side = "CE" if ce["vol"] > pe["vol"] else "PE"
+    oi_side = "CE" if ce["coi"] > pe["coi"] else "PE"
+
+    pcr = round(pe["oi"] / ce["oi"], 2) if ce["oi"] else 1.0
+    reasons.append(f"PCR = {pcr}")
+
+    if pcr > ATM_PCR_UPPER:
+        pcr_side = "CE"
+    elif pcr < ATM_PCR_LOWER:
+        pcr_side = "PE"
     else:
-        return "MARKET CLOSED", now
+        pcr_side = "NEUTRAL"
+
+    trend, df_und = market_trend_last5()
+    reasons.append(f"Trend = {trend}")
+
+    rsi = calculate_rsi(df_und['Close'])
+    latest_rsi = round(rsi.iloc[-1], 2) if not rsi.empty else None
+    reasons.append(f"RSI(14) = {latest_rsi}")
+
+    supports, resistances = find_support_resistance(df_und['Close'])
+    reasons.append(f"Support: {supports[-3:] if supports else 'N/A'}")
+    reasons.append(f"Resistance: {resistances[-3:] if resistances else 'N/A'}")
+
+    bullish_engulf = is_bullish_engulfing(df_und)
+    reasons.append(f"Bullish Engulfing: {'Yes' if bullish_engulf else 'No'}")
+
+    iv_ce = ce["iv"]
+    iv_pe = pe["iv"]
+    reasons.append(f"IV CE = {iv_ce:.2f}, IV PE = {iv_pe:.2f}")
+
+    votes = [vol_side, oi_side, pcr_side]
+    if trend == "UP": votes.append("CE")
+    if trend == "DOWN": votes.append("PE")
+    if iv_pe > iv_ce * 1.1: votes.append("PE")
+    if iv_ce > iv_pe * 1.1: votes.append("CE")
+
+    ce_votes = votes.count("CE")
+    pe_votes = votes.count("PE")
+
+    reasons.append(f"Votes CE={ce_votes}, PE={pe_votes}")
+
+    if ce_votes > pe_votes and ce_votes >= 2:
+        return "BUY CE", reasons
+    if pe_votes > ce_votes and pe_votes >= 2:
+        return "BUY PE", reasons
+    if bullish_engulf and trend == "UP":
+        return "STRONG BUY CE (Bullish Engulfing)", reasons
+    return "NO TRADE", reasons
 
 
-# ========== UI START ==========
-st.set_page_config(page_title="Pro Nifty Option Signal", layout="centered")
+def data_fetch_loop():
+    global latest_signal
+    session = get_nse_session()
+
+    while running:
+        json_data = fetch_option_chain(session)
+        df = flatten_option_chain(json_data)
+        signal, reasons = compute_signal(df)
+        now = datetime.now().strftime("%H:%M:%S")
+
+        latest_signal = {
+            "time": now,
+            "signal": signal,
+            "reasons": reasons
+        }
+        time.sleep(LOOP_SECONDS)
+
+
+# ---------- STREAMLIT UI ----------
+st.set_page_config(page_title="PRO NIFTY OPTION SIGNAL", layout="wide")
+
+if "started" not in st.session_state:
+    st.session_state.started = True
+    threading.Thread(target=data_fetch_loop, daemon=True).start()
 
 st.title("🚀 PRO NIFTY OPTION SIGNAL")
 
-status, now = get_market_status()
+sig = latest_signal.get("signal", "--")
+t = latest_signal.get("time", "--:--:--")
+reasons = latest_signal.get("reasons", [])
 
-st.write("Last updated:", now.strftime("%H:%M:%S"))
-
-# UI STATUS COLOR
-if status == "MARKET OPEN":
-    st.markdown(
-        "<h1 style='color:green; font-weight:700;'>MARKET OPEN</h1>",
-        unsafe_allow_html=True
-    )
+# Signal color
+if "MARKET CLOSED" in sig:
+    st.markdown("### 🟠 MARKET CLOSED")
+elif "BUY CE" in sig:
+    st.markdown("### 🟢 BUY CE")
+elif "BUY PE" in sig:
+    st.markdown("### 🔴 BUY PE")
+elif "STRONG BUY" in sig:
+    st.markdown("### 🔵 STRONG BUY CE")
 else:
-    st.markdown(
-        "<h1 style='color:orange; font-weight:700;'>MARKET CLOSED</h1>",
-        unsafe_allow_html=True
-    )
+    st.markdown("### ⚪ NO TRADE")
 
+st.write(f"**Last Updated:** {t}")
+st.write(f"**Signal:** {sig}")
 
-# ========== REASONS BOX ==========
 st.subheader("Reasons")
+for r in reasons:
+    st.write("✔️", r)
 
-if status == "MARKET CLOSED":
-    st.write("• Market is closed. Trading hours: 9:15 AM to 3:30 PM IST ❌")
-else:
-    st.write("• Market is open. Signals will auto-refresh ✔️")
-
-
-# ========== LIVE SIGNAL UI (SAME CONDITION PAR) ==========
-st.subheader("📊 Live Nifty Option Signal")
-
-if status == "MARKET OPEN":
-    st.success("Waiting for signal... (market open)")
-    st.info("Auto-refresh every 15 seconds enabled")
-else:
-    st.warning("Signal OFF — Market Closed")
-
-
-# ========== AUTO REFRESH BUTTON ==========
-if st.button("Auto-refresh now"):
-    st.experimental_rerun()
-
-
-# ========== AUTO REFRESH EVERY 15s ==========
-time.sleep(15)
+time.sleep(LOOP_SECONDS)
 st.experimental_rerun()
