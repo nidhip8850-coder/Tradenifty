@@ -7,6 +7,7 @@ import yfinance as yf
 import logging
 import numpy as np
 import streamlit as st
+import pytz   # <-- NEW (FOR IST FIX)
 
 hide_streamlit_style = """
     <style>
@@ -45,9 +46,13 @@ st.title("PRO NIFTY OPTION SIGNAL")
 placeholder = st.empty()
 
 # ---------- UTILITY FUNCTIONS ----------
+
+# --------------------- FIXED ---------------------
 def is_market_open():
-    now = datetime.now().time()
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist).time()   # correct IST time
     return MARKET_OPEN <= now <= MARKET_CLOSE
+# -------------------------------------------------
 
 def get_nse_session():
     s = requests.Session()
